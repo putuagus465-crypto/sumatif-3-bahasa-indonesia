@@ -61,10 +61,36 @@ export default function App() {
   const [printKisiKisiOpen, setPrintKisiKisiOpen] = useState(false);
   const [printItemAnalysisOpen, setPrintItemAnalysisOpen] = useState(false);
 
-  // Load initial settings and results from storage
+  // Load initial settings and results from storage with real-time sync listeners
   useEffect(() => {
     setSettings(getExamSettings());
     setAllResults(getAllExamResults());
+
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key && e.key.includes('bindonesia_results')) {
+        setAllResults(getAllExamResults());
+      }
+    };
+    window.addEventListener('storage', handleStorage);
+
+    let channel: BroadcastChannel | null = null;
+    try {
+      if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+        channel = new BroadcastChannel('sdn3_exam_sync');
+        channel.onmessage = (event) => {
+          if (event.data?.type === 'NEW_SUBMISSION' || event.data?.type === 'REFRESH_RESULTS') {
+            setAllResults(getAllExamResults());
+          }
+        };
+      }
+    } catch {
+      // Ignore unsupported broadcast channel
+    }
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      channel?.close();
+    };
   }, []);
 
   // TAHAP 1 -> TAHAP 2: Mulai Tes

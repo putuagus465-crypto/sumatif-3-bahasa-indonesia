@@ -91,6 +91,8 @@ export interface ExamResultData {
   };
   evaluations: QuestionEvaluation[];
   sentToSpreadsheet: boolean;
+  source?: 'spreadsheet' | 'local';
+  spreadsheetRow?: number;
 }
 
 export interface ExamSettings {

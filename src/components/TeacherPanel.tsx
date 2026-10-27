@@ -30,6 +30,12 @@ import {
   Sparkles,
   Eye,
   Info,
+  Globe,
+  Wifi,
+  Cloud,
+  CheckCheck,
+  Send,
+  Radio,
 } from 'lucide-react';
 import { ExamResultData, ExamSettings, Question } from '../types';
 import {
@@ -37,8 +43,11 @@ import {
   clearAllExamResults,
   resetToSampleResults,
   saveExamSettings,
+  saveExamResult,
   GOOGLE_APPS_SCRIPT_SAMPLE,
   sendToGoogleSheetWebhook,
+  fetchSpreadsheetResults,
+  mergeSpreadsheetAndLocalResults,
   downloadMatrixItemAnalysisCSV,
 } from '../utils/spreadsheet';
 import { StudentDetailAnalysisModal } from './StudentDetailAnalysisModal';
@@ -75,12 +84,13 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
   const [passwordInput, setPasswordInput] = useState('');
   const [authError, setAuthError] = useState('');
 
-  // Tab navigation
-  const [activeTab, setActiveTab] = useState<'matriks' | 'kisi_kisi' | 'rekap' | 'pengaturan' | 'script'>('matriks');
+  // Tab navigation (including dedicated real-time spreadsheet feed tab)
+  const [activeTab, setActiveTab] = useState<'matriks' | 'kisi_kisi' | 'rekap' | 'spreadsheet_live' | 'pengaturan' | 'script'>('matriks');
 
   // Search and filter
   const [searchQuery, setSearchQuery] = useState('');
   const [filterStatus, setFilterStatus] = useState<'all' | 'tuntas' | 'remedial'>('all');
+  const [filterSource, setFilterSource] = useState<'all' | 'spreadsheet' | 'local'>('all');
 
   // Selected student for detailed modal
   const [selectedStudentResult, setSelectedStudentResult] = useState<ExamResultData | null>(null);
@@ -91,6 +101,16 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
   const [copiedScript, setCopiedScript] = useState(false);
   const [testingWebhook, setTestingWebhook] = useState(false);
   const [webhookTestMessage, setWebhookTestMessage] = useState('');
+  const [testingGet, setTestingGet] = useState(false);
+  const [testGetMessage, setTestGetMessage] = useState('');
+
+  // REAL-TIME SPREADSHEET SYNCHRONIZATION STATES
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [lastSyncTime, setLastSyncTime] = useState<string>(new Date().toLocaleTimeString('id-ID'));
+  const [syncToast, setSyncToast] = useState<string>('');
+  const [spreadsheetResults, setSpreadsheetResults] = useState<ExamResultData[]>([]);
+  const [autoSyncEnabled, setAutoSyncEnabled] = useState(true);
+  const [sendingSingleId, setSendingSingleId] = useState<string | null>(null);
 
   // Sync local settings whenever settings change or panel opens
   useEffect(() => {
@@ -98,6 +118,88 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
       setLocalSettings({ ...settings });
     }
   }, [isOpen, settings]);
+
+  // Synchronize student data directly with Google Spreadsheet
+  const handleSyncSpreadsheet = async (showFeedback = true) => {
+    const targetUrl = (localSettings.sheetWebhookUrl || settings.sheetWebhookUrl || '').trim();
+    if (!targetUrl || !targetUrl.startsWith('http')) {
+      if (showFeedback) {
+        setSyncToast('URL Google Spreadsheet / Webhook belum dikonfigurasi di tab Pengaturan.');
+        setTimeout(() => setSyncToast(''), 4000);
+      }
+      return;
+    }
+
+    setIsSyncing(true);
+    try {
+      const res = await fetchSpreadsheetResults(targetUrl, settings, questions);
+      if (res.success && res.data.length > 0) {
+        setSpreadsheetResults(res.data);
+        mergeSpreadsheetAndLocalResults(results, res.data);
+        onRefreshResults();
+        setLastSyncTime(new Date().toLocaleTimeString('id-ID'));
+        if (showFeedback) {
+          setSyncToast(`Berhasil menyinkronkan ${res.count} nilai langsung dari Google Spreadsheet secara real time!`);
+          setTimeout(() => setSyncToast(''), 4000);
+        }
+      } else if (res.success && res.data.length === 0) {
+        setLastSyncTime(new Date().toLocaleTimeString('id-ID'));
+        if (showFeedback) {
+          setSyncToast('Koneksi Google Spreadsheet aktif. Belum ada baris nilai baru.');
+          setTimeout(() => setSyncToast(''), 3500);
+        }
+      } else {
+        if (showFeedback) {
+          setSyncToast(res.message);
+          setTimeout(() => setSyncToast(''), 5000);
+        }
+      }
+    } catch (err: any) {
+      if (showFeedback) {
+        setSyncToast('Gagal terhubung ke Google Spreadsheet: ' + (err.message || 'Koneksi terputus'));
+        setTimeout(() => setSyncToast(''), 5000);
+      }
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  // Real-time Background Polling Engine & Cross-Tab Broadcast Listener
+  useEffect(() => {
+    if (!isOpen || !isAuthenticated) return;
+
+    // Fetch initial sync on panel opening
+    handleSyncSpreadsheet(false);
+
+    // Setup periodic polling every 10 seconds for real-time live updates
+    let pollInterval: any = null;
+    if (autoSyncEnabled) {
+      pollInterval = setInterval(() => {
+        handleSyncSpreadsheet(false);
+      }, 10000);
+    }
+
+    // Setup BroadcastChannel for instant 0ms cross-tab student submissions
+    let channel: BroadcastChannel | null = null;
+    try {
+      if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+        channel = new BroadcastChannel('sdn3_exam_sync');
+        channel.onmessage = (event) => {
+          if (event.data?.type === 'NEW_SUBMISSION' || event.data?.type === 'REFRESH_RESULTS') {
+            onRefreshResults();
+            handleSyncSpreadsheet(false);
+          }
+        };
+      }
+    } catch {
+      // Fallback
+    }
+
+    return () => {
+      if (pollInterval) clearInterval(pollInterval);
+      channel?.close();
+    };
+  }, [isOpen, isAuthenticated, autoSyncEnabled, settings.sheetWebhookUrl, localSettings.sheetWebhookUrl]);
 
   if (!isOpen) return null;
 
@@ -107,8 +209,40 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
     if (passwordInput === settings.teacherPassword) {
       setIsAuthenticated(true);
       setAuthError('');
+      // Trigger sync upon successful login
+      setTimeout(() => handleSyncSpreadsheet(false), 200);
     } else {
       setAuthError('Password salah. Silakan masukkan password guru yang valid.');
+    }
+  };
+
+  // Manual resend single student record to Spreadsheet
+  const handleSendSingleToSheet = async (resultItem: ExamResultData) => {
+    const targetUrl = (localSettings.sheetWebhookUrl || settings.sheetWebhookUrl || '').trim();
+    if (!targetUrl || !targetUrl.startsWith('http')) {
+      setSyncToast('URL Webhook belum diatur di tab Pengaturan.');
+      setTimeout(() => setSyncToast(''), 3000);
+      return;
+    }
+
+    setSendingSingleId(resultItem.id);
+    try {
+      const ok = await sendToGoogleSheetWebhook(targetUrl, resultItem, settings);
+      if (ok) {
+        const updated = { ...resultItem, sentToSpreadsheet: true, source: 'spreadsheet' as const };
+        await saveExamResult(updated);
+        onRefreshResults();
+        setSyncToast(`Nilai siswa ${resultItem.student.fullName} berhasil dikirim ke Google Spreadsheet!`);
+        setTimeout(() => setSyncToast(''), 3500);
+      } else {
+        setSyncToast('Gagal mengirim nilai ke Google Spreadsheet. Periksa koneksi.');
+        setTimeout(() => setSyncToast(''), 3500);
+      }
+    } catch {
+      setSyncToast('Terjadi kesalahan saat pengiriman ke Spreadsheet.');
+      setTimeout(() => setSyncToast(''), 3500);
+    } finally {
+      setSendingSingleId(null);
     }
   };
 
@@ -123,7 +257,13 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
         : filterStatus === 'tuntas'
         ? r.passed
         : !r.passed;
-    return matchesSearch && matchesStatus;
+    const matchesSource =
+      filterSource === 'all'
+        ? true
+        : filterSource === 'spreadsheet'
+        ? r.sentToSpreadsheet || r.source === 'spreadsheet'
+        : !(r.sentToSpreadsheet || r.source === 'spreadsheet');
+    return matchesSearch && matchesStatus && matchesSource;
   });
 
   // Calculate stats
@@ -136,6 +276,7 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
     : 0;
   const maxScore = totalSubmissions > 0 ? Math.max(...results.map((r) => r.score)) : 0;
   const minScore = totalSubmissions > 0 ? Math.min(...results.map((r) => r.score)) : 0;
+  const spreadsheetSyncedCount = results.filter((r) => r.sentToSpreadsheet || r.source === 'spreadsheet').length;
 
   // Distributions for summary cards
   const totalQuestions = questions.length;
@@ -173,7 +314,6 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
     const weightedScore = fullCorrect + partial * 0.5;
     const percentage = totalSubmissions > 0 ? Math.round((weightedScore / totalSubmissions) * 100) : 0;
 
-    // Klasifikasi empiris kesukaran: Mudah (>70%), Sedang (30-70%), Sukar (<30%)
     let empirical = 'Sedang';
     if (percentage > 70) empirical = 'Mudah';
     else if (percentage < 30) empirical = 'Sukar';
@@ -204,7 +344,7 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
     setTimeout(() => setCopiedScript(false), 2500);
   };
 
-  // Test Webhook
+  // Test Webhook POST
   const handleTestWebhook = async () => {
     if (!localSettings.sheetWebhookUrl || !localSettings.sheetWebhookUrl.startsWith('http')) {
       setWebhookTestMessage('Masukkan URL Webhook Google Apps Script yang valid terlebih dahulu.');
@@ -216,20 +356,20 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
     try {
       const dummyResult: ExamResultData = {
         id: 'test-sample',
-        student: { fullName: 'Uji Coba Koneksi Siswa', absenceNumber: '99', className: settings.className },
+        student: { fullName: 'Uji Coba Pengiriman Siswa', absenceNumber: '99', className: settings.className },
         timestamp: new Date().toISOString(),
         formattedDate: new Date().toLocaleString('id-ID'),
         durationSeconds: 900,
         durationFormatted: '15m 00s',
-        totalQuestions: 30,
-        correctCount: 25,
+        totalQuestions: 40,
+        correctCount: 35,
         partialCount: 3,
         incorrectCount: 2,
-        score: 85,
+        score: 87.5,
         passed: true,
         kktp: settings.kktp,
         breakdown: {
-          pg: { correct: 18, total: 20 },
+          pg: { correct: 28, total: 30 },
           kategori: { correct: 7, partial: 2, total: 10 },
         },
         evaluations: [],
@@ -238,14 +378,38 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
 
       const success = await sendToGoogleSheetWebhook(localSettings.sheetWebhookUrl, dummyResult);
       if (success) {
-        setWebhookTestMessage('Uji pengiriman berhasil dikirim ke Google Sheets.');
+        setWebhookTestMessage('Uji pengiriman POST berhasil dikirim ke Google Sheets.');
       } else {
-        setWebhookTestMessage('Gagal mengirim data. Periksa pengaturan akses web app.');
+        setWebhookTestMessage('Gagal mengirim data POST. Periksa URL atau pengaturan web app.');
       }
     } catch {
       setWebhookTestMessage('Terjadi kesalahan koneksi.');
     } finally {
       setTestingWebhook(false);
+    }
+  };
+
+  // Test Webhook GET (Real-time live fetch test)
+  const handleTestGet = async () => {
+    if (!localSettings.sheetWebhookUrl || !localSettings.sheetWebhookUrl.startsWith('http')) {
+      setTestGetMessage('Masukkan URL Webhook Google Apps Script terlebih dahulu.');
+      return;
+    }
+
+    setTestingGet(true);
+    setTestGetMessage('');
+    try {
+      const res = await fetchSpreadsheetResults(localSettings.sheetWebhookUrl, settings, questions);
+      if (res.success) {
+        setTestGetMessage(`Berhasil membaca real time! Ditemukan ${res.count} baris nilai di Google Spreadsheet.`);
+        setSpreadsheetResults(res.data);
+      } else {
+        setTestGetMessage(res.message);
+      }
+    } catch (e: any) {
+      setTestGetMessage('Gagal mengambil data GET: ' + (e.message || 'Koneksi error'));
+    } finally {
+      setTestingGet(false);
     }
   };
 
@@ -276,14 +440,60 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={onClose}
-            className="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-white/10 transition-colors cursor-pointer"
-          >
-            ✕
-          </button>
+          <div className="flex items-center gap-3">
+            {isAuthenticated && (
+              <div className="hidden sm:flex items-center gap-2.5">
+                <div className="flex items-center gap-2 bg-emerald-500/15 border border-emerald-500/30 px-3 py-1.5 rounded-xl text-xs text-emerald-300 shadow-inner">
+                  <span className="relative flex h-2.5 w-2.5">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+                  </span>
+                  <span className="font-bold">Live Real-Time</span>
+                  <span className="text-[11px] text-emerald-400/80 hidden md:inline">
+                    • Sinkron: {lastSyncTime}
+                  </span>
+                </div>
+
+                <button
+                  type="button"
+                  id="btn-sync-spreadsheet-realtime"
+                  onClick={() => handleSyncSpreadsheet(true)}
+                  disabled={isSyncing}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white rounded-xl text-xs font-bold transition-all shadow-xs cursor-pointer disabled:opacity-60"
+                  title="Tarik &amp; sinkronkan data nilai dari Google Spreadsheet secara real time"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+                  <span>{isSyncing ? 'Sinkron...' : 'Tarik Spreadsheet'}</span>
+                </button>
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={onClose}
+              className="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-white/10 transition-colors cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
         </div>
+
+        {/* Real-Time Sync Notification Toast */}
+        {syncToast && (
+          <div className="bg-emerald-700 text-white px-6 py-2 text-xs font-medium flex items-center justify-between shrink-0 shadow-inner">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-emerald-300 shrink-0" />
+              <span>{syncToast}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSyncToast('')}
+              className="text-emerald-200 hover:text-white font-bold p-1 cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
+        )}
 
         {/* Auth Gate */}
         {!isAuthenticated ? (
@@ -354,11 +564,12 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
                   }`}
                 >
                   <Layers className="w-4 h-4" />
-                  <span>Kisi-Kisi Soal (30 Butir)</span>
+                  <span>Kisi-Kisi Soal ({questions.length} Butir)</span>
                 </button>
 
                 <button
                   type="button"
+                  id="tab-rekap"
                   onClick={() => setActiveTab('rekap')}
                   className={`px-3 py-1.5 rounded-xl text-xs sm:text-sm font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
                     activeTab === 'rekap'
@@ -367,7 +578,25 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
                   }`}
                 >
                   <Table className="w-4 h-4" />
-                  <span>Daftar Nilai ({results.length})</span>
+                  <span>Daftar Nilai Siswa ({results.length})</span>
+                </button>
+
+                <button
+                  type="button"
+                  id="tab-spreadsheet-live"
+                  onClick={() => {
+                    setActiveTab('spreadsheet_live');
+                    handleSyncSpreadsheet(false);
+                  }}
+                  className={`px-3 py-1.5 rounded-xl text-xs sm:text-sm font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                    activeTab === 'spreadsheet_live'
+                      ? 'bg-emerald-700 text-white shadow-xs'
+                      : 'text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200'
+                  }`}
+                >
+                  <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+                  <span>Spreadsheet Real-Time ({spreadsheetResults.length > 0 ? spreadsheetResults.length : spreadsheetSyncedCount})</span>
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping ml-0.5"></span>
                 </button>
 
                 <button
@@ -954,26 +1183,147 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
               )}
 
               {/* ========================================================================= */}
-              {/* TAB 3: DAFTAR NILAI & RAPORT SISWA                                        */}
+              {/* TAB 3: DAFTAR NILAI & STATUS SPREADSHEET (REAL-TIME)                      */}
               {/* ========================================================================= */}
               {activeTab === 'rekap' && (
                 <div className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <h3 className="font-bold text-base text-slate-900">
-                      Rekapitulasi Nilai Peserta Didik
-                    </h3>
-                    <div className="flex items-center gap-2">
+                  {/* Real-Time Sync & Status Control Bar */}
+                  <div className="p-4 rounded-2xl bg-gradient-to-r from-emerald-900/90 via-teal-900/90 to-slate-900 text-white shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div className="flex items-start gap-3">
+                      <div className="w-10 h-10 rounded-xl bg-emerald-500/20 border border-emerald-400/30 flex items-center justify-center shrink-0 mt-0.5">
+                        <Radio className="w-5 h-5 text-emerald-400 animate-pulse" />
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-sm text-emerald-200">
+                            Sinkronisasi Nilai Real-Time
+                          </span>
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-400/30">
+                            {autoSyncEnabled ? 'Auto-Sync Aktif (10s)' : 'Manual'}
+                          </span>
+                        </div>
+                        <p className="text-xs text-emerald-100/80 mt-0.5">
+                          Terakhir diperbarui: <strong>{lastSyncTime}</strong> • {spreadsheetSyncedCount} dari {results.length} siswa tersinkron di Spreadsheet.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setAutoSyncEnabled(!autoSyncEnabled)}
+                        className={`px-3 py-1.5 rounded-xl text-xs font-semibold border transition-all cursor-pointer ${
+                          autoSyncEnabled
+                            ? 'bg-emerald-800/60 border-emerald-500/50 text-emerald-200 hover:bg-emerald-800'
+                            : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+                        }`}
+                        title="Aktifkan atau jeda pembaruan otomatis setiap 10 detik"
+                      >
+                        {autoSyncEnabled ? '⏸ Jeda Auto-Sync' : '▶ Lanjutkan Auto-Sync'}
+                      </button>
+
+                      <button
+                        type="button"
+                        id="btn-sync-now-rekap"
+                        onClick={() => handleSyncSpreadsheet(true)}
+                        disabled={isSyncing}
+                        className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-sm transition-all cursor-pointer disabled:opacity-50"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+                        <span>{isSyncing ? 'Menyinkronkan...' : 'Tarik Data Spreadsheet'}</span>
+                      </button>
+
                       <button
                         type="button"
                         onClick={() => downloadMatrixItemAnalysisCSV(results, questions, settings)}
-                        className="px-3.5 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs cursor-pointer"
+                        className="px-3.5 py-1.5 bg-white/10 hover:bg-white/20 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 border border-white/20 shadow-xs cursor-pointer"
                       >
-                        <Download className="w-4 h-4" />
-                        <span>Unduh CSV Nilai</span>
+                        <Download className="w-3.5 h-3.5" />
+                        <span>Ekspor CSV</span>
                       </button>
                     </div>
                   </div>
 
+                  {/* Filter and Search Bar */}
+                  <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-3 rounded-2xl border border-slate-200 shadow-xs">
+                    <div className="flex items-center gap-2 flex-1 min-w-[240px]">
+                      <Search className="w-4 h-4 text-slate-400 shrink-0" />
+                      <input
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        placeholder="Cari nama siswa atau no. absen..."
+                        className="w-full text-xs sm:text-sm bg-transparent outline-none placeholder:text-slate-400 font-medium"
+                      />
+                    </div>
+
+                    <div className="flex items-center gap-1.5 overflow-x-auto py-1">
+                      {/* Filter Kelulusan */}
+                      <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mr-1">Status:</span>
+                      <button
+                        type="button"
+                        onClick={() => setFilterStatus('all')}
+                        className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                          filterStatus === 'all'
+                            ? 'bg-blue-700 text-white'
+                            : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                        }`}
+                      >
+                        Semua ({results.length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFilterStatus('tuntas')}
+                        className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                          filterStatus === 'tuntas'
+                            ? 'bg-emerald-700 text-white'
+                            : 'bg-emerald-50 text-emerald-800 hover:bg-emerald-100 border border-emerald-200'
+                        }`}
+                      >
+                        Tuntas ({passedCount})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFilterStatus('remedial')}
+                        className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                          filterStatus === 'remedial'
+                            ? 'bg-rose-700 text-white'
+                            : 'bg-rose-50 text-rose-800 hover:bg-rose-100 border border-rose-200'
+                        }`}
+                      >
+                        Remedial ({remedialCount})
+                      </button>
+
+                      {/* Filter Sumber */}
+                      <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mx-1">Sumber:</span>
+                      <button
+                        type="button"
+                        onClick={() => setFilterSource('spreadsheet')}
+                        className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                          filterSource === 'spreadsheet'
+                            ? 'bg-emerald-700 text-white'
+                            : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                        }`}
+                        title="Tampilkan data yang telah tercatat di Google Spreadsheet"
+                      >
+                        ✅ Spreadsheet ({spreadsheetSyncedCount})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFilterSource('local')}
+                        className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                          filterSource === 'local'
+                            ? 'bg-slate-800 text-white'
+                            : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                        }`}
+                        title="Tampilkan data lokal yang belum tersinkron ke Spreadsheet"
+                      >
+                        💾 Lokal ({results.length - spreadsheetSyncedCount})
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Results Table */}
                   <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs">
                     <div className="overflow-x-auto">
                       <table className="w-full border-collapse text-xs text-left">
@@ -982,47 +1332,265 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
                             <th className="p-3 w-12 text-center">No</th>
                             <th className="p-3 w-16">Absen</th>
                             <th className="p-3">Nama Lengkap</th>
-                            <th className="p-3 w-28">Waktu Tes</th>
+                            <th className="p-3 w-32">Waktu Tes</th>
                             <th className="p-3 w-20 text-center">Durasi</th>
                             <th className="p-3 w-20 text-center">Benar</th>
                             <th className="p-3 w-20 text-center">Nilai</th>
                             <th className="p-3 w-24 text-center">Status</th>
-                            <th className="p-3 w-36 text-center">Aksi Dokumen</th>
+                            <th className="p-3 w-36 text-center">Sinkron Spreadsheet</th>
+                            <th className="p-3 w-32 text-center">Aksi Dokumen</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
-                          {results.map((r, idx) => (
-                            <tr key={r.id} className="hover:bg-slate-50 transition-colors">
-                              <td className="p-3 text-center text-slate-500 font-medium">{idx + 1}</td>
-                              <td className="p-3 font-mono font-bold text-slate-800">#{r.student.absenceNumber}</td>
-                              <td className="p-3 font-semibold text-slate-900">{r.student.fullName}</td>
-                              <td className="p-3 text-slate-500">{r.formattedDate}</td>
-                              <td className="p-3 text-center text-slate-600">{r.durationFormatted || '15m'}</td>
-                              <td className="p-3 text-center font-bold text-slate-700">
-                                {r.correctCount} / {r.totalQuestions}
+                          {filteredResults.length === 0 ? (
+                            <tr>
+                              <td colSpan={10} className="p-8 text-center text-slate-500">
+                                Tidak ada data hasil nilai siswa yang cocok dengan filter atau pencarian.
                               </td>
-                              <td className="p-3 text-center font-black text-sm text-slate-900">{r.score}</td>
+                            </tr>
+                          ) : (
+                            filteredResults.map((r, idx) => {
+                              const isSynced = r.sentToSpreadsheet || r.source === 'spreadsheet';
+                              const isSending = sendingSingleId === r.id;
+
+                              return (
+                                <tr key={r.id} className="hover:bg-slate-50 transition-colors">
+                                  <td className="p-3 text-center text-slate-500 font-medium">{idx + 1}</td>
+                                  <td className="p-3 font-mono font-bold text-slate-800">#{r.student.absenceNumber}</td>
+                                  <td className="p-3">
+                                    <div className="font-semibold text-slate-900">{r.student.fullName}</div>
+                                    <div className="text-[10px] text-slate-400">{r.student.className}</div>
+                                  </td>
+                                  <td className="p-3 text-slate-500">{r.formattedDate}</td>
+                                  <td className="p-3 text-center text-slate-600">{r.durationFormatted || '15m 00s'}</td>
+                                  <td className="p-3 text-center font-bold text-slate-700">
+                                    {r.correctCount} / {r.totalQuestions}
+                                  </td>
+                                  <td className="p-3 text-center font-black text-sm text-slate-900">{r.score}</td>
+                                  <td className="p-3 text-center">
+                                    <span className={`px-2.5 py-1 rounded-full text-[11px] font-bold ${
+                                      r.passed
+                                        ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                                        : 'bg-rose-100 text-rose-800 border border-rose-200'
+                                    }`}>
+                                      {r.passed ? 'Tuntas' : 'Remedial'}
+                                    </span>
+                                  </td>
+                                  <td className="p-3 text-center">
+                                    {isSynced ? (
+                                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px] font-semibold" title="Data nilai sudah tersimpan di Google Spreadsheet">
+                                        <CheckCheck className="w-3.5 h-3.5 text-emerald-600" />
+                                        <span>Tersinkron</span>
+                                      </span>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleSendSingleToSheet(r)}
+                                        disabled={isSending}
+                                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 text-[11px] font-semibold transition-all cursor-pointer disabled:opacity-50"
+                                        title="Kirim nilai siswa ini ke Google Spreadsheet"
+                                      >
+                                        <Send className={`w-3 h-3 ${isSending ? 'animate-spin' : ''}`} />
+                                        <span>{isSending ? 'Mengirim...' : 'Kirim Sheet'}</span>
+                                      </button>
+                                    )}
+                                  </td>
+                                  <td className="p-3 text-center space-x-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => setSelectedStudentResult(r)}
+                                      className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold cursor-pointer"
+                                      title="Analisis Butir &amp; Rekomendasi"
+                                    >
+                                      Analisis
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => onPrintStudentReport(r)}
+                                      className="px-2.5 py-1 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg text-xs font-semibold cursor-pointer"
+                                      title="Cetak Rapor Hasil Siswa"
+                                    >
+                                      Rapor
+                                    </button>
+                                  </td>
+                                </tr>
+                              );
+                            })
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* ========================================================================= */}
+              {/* TAB 4: LIVE FEED SPREADSHEET (DATA LANGSUNG DARI GOOGLE SPREADSHEET)      */}
+              {/* ========================================================================= */}
+              {activeTab === 'spreadsheet_live' && (
+                <div className="space-y-6">
+                  {/* Real-Time Live Header Banner */}
+                  <div className="bg-gradient-to-r from-emerald-800 via-teal-800 to-indigo-950 text-white rounded-3xl p-6 sm:p-8 shadow-md relative overflow-hidden">
+                    <div className="absolute top-0 right-0 translate-x-8 -translate-y-8 w-60 h-60 bg-emerald-500/20 rounded-full blur-2xl pointer-events-none"></div>
+                    <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-6">
+                      <div className="space-y-2">
+                        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/30 border border-emerald-400/30 text-emerald-200 text-xs font-bold">
+                          <Radio className="w-3.5 h-3.5 animate-pulse text-emerald-300" />
+                          <span>Live Data Feed Langsung dari Google Spreadsheet</span>
+                        </div>
+                        <h3 className="text-xl sm:text-2xl font-extrabold tracking-tight">
+                          Daftar Nilai Siswa di Google Spreadsheet
+                        </h3>
+                        <p className="text-emerald-100/80 text-xs sm:text-sm max-w-2xl leading-relaxed">
+                          Menampilkan baris data nilai ujian yang tersimpan secara real time di spreadsheet tab mata pelajaran <strong className="text-white font-bold">{settings.subject}</strong>.
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2.5">
+                        <button
+                          type="button"
+                          onClick={() => handleSyncSpreadsheet(true)}
+                          disabled={isSyncing}
+                          className="px-4 py-2.5 bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-slate-950 rounded-xl text-xs font-bold shadow-md flex items-center gap-2 cursor-pointer transition-all disabled:opacity-60"
+                        >
+                          <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
+                          <span>{isSyncing ? 'Menarik Data...' : 'Muat Ulang Live Feed'}</span>
+                        </button>
+
+                        {localSettings.sheetWebhookUrl && localSettings.sheetWebhookUrl.includes('spreadsheets') && (
+                          <a
+                            href={localSettings.sheetWebhookUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-4 py-2.5 bg-white/10 hover:bg-white/20 border border-white/20 text-white rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer transition-colors"
+                          >
+                            <ExternalLink className="w-4 h-4" />
+                            <span>Buka Google Sheets</span>
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Summary Metric Cards for Spreadsheet Data */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="p-4 rounded-2xl bg-white border border-slate-200 shadow-xs">
+                      <span className="text-xs text-slate-500 font-semibold block">Total Baris di Sheet</span>
+                      <div className="flex items-baseline gap-2 mt-1">
+                        <strong className="text-2xl font-black text-slate-900">
+                          {spreadsheetResults.length > 0 ? spreadsheetResults.length : spreadsheetSyncedCount}
+                        </strong>
+                        <span className="text-xs text-slate-500">Siswa Tercatat</span>
+                      </div>
+                    </div>
+
+                    <div className="p-4 rounded-2xl bg-white border border-slate-200 shadow-xs">
+                      <span className="text-xs text-slate-500 font-semibold block">Rata-Rata Nilai</span>
+                      <div className="flex items-baseline gap-2 mt-1">
+                        <strong className="text-2xl font-black text-blue-700">{avgScore}</strong>
+                        <span className="text-xs text-slate-500">Skala 100</span>
+                      </div>
+                    </div>
+
+                    <div className="p-4 rounded-2xl bg-white border border-slate-200 shadow-xs">
+                      <span className="text-xs text-slate-500 font-semibold block">Ketuntasan (KKTP &gt;= {settings.kktp})</span>
+                      <div className="flex items-baseline gap-2 mt-1">
+                        <strong className="text-2xl font-black text-emerald-700">{passedCount}</strong>
+                        <span className="text-xs text-slate-500">Siswa ({passRate}%)</span>
+                      </div>
+                    </div>
+
+                    <div className="p-4 rounded-2xl bg-white border border-slate-200 shadow-xs">
+                      <span className="text-xs text-slate-500 font-semibold block">Nilai Tertinggi</span>
+                      <div className="flex items-baseline gap-2 mt-1">
+                        <strong className="text-2xl font-black text-purple-700">{maxScore}</strong>
+                        <span className="text-xs text-slate-500">Poin</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Live Spreadsheet Table */}
+                  <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs">
+                    <div className="p-4 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex items-center gap-2">
+                        <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+                        <h4 className="font-bold text-sm text-slate-900">
+                          Tabel Nilai Siswa Terkini di Google Spreadsheet
+                        </h4>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs text-slate-500">
+                          Pembaruan otomatis: <span className="font-bold text-emerald-700">Aktif</span>
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="overflow-x-auto">
+                      <table className="w-full border-collapse text-xs text-left">
+                        <thead className="bg-slate-100 text-slate-700 font-bold border-b border-slate-200">
+                          <tr>
+                            <th className="p-3 w-16 text-center">Baris</th>
+                            <th className="p-3 w-16">Absen</th>
+                            <th className="p-3">Nama Siswa</th>
+                            <th className="p-3 w-36">Waktu Pencatatan</th>
+                            <th className="p-3 w-20 text-center">Durasi</th>
+                            <th className="p-3 w-24 text-center">Rincian Benar</th>
+                            <th className="p-3 w-20 text-center">Nilai</th>
+                            <th className="p-3 w-24 text-center">Status KKTP</th>
+                            <th className="p-3 w-32 text-center">Aksi Dokumen</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {(spreadsheetResults.length > 0
+                            ? spreadsheetResults
+                            : results.filter((r) => r.sentToSpreadsheet || r.source === 'spreadsheet')
+                          ).map((item, idx) => (
+                            <tr key={item.id} className="hover:bg-emerald-50/40 transition-colors">
+                              <td className="p-3 text-center font-mono text-slate-500">
+                                {item.spreadsheetRow ? `#Row ${item.spreadsheetRow}` : `#${idx + 1}`}
+                              </td>
+                              <td className="p-3 font-mono font-bold text-slate-800">#{item.student.absenceNumber}</td>
+                              <td className="p-3 font-semibold text-slate-900">
+                                <div>{item.student.fullName}</div>
+                                <div className="text-[10px] text-slate-400">{item.student.className || settings.className}</div>
+                              </td>
+                              <td className="p-3 text-slate-600 font-mono text-[11px]">{item.formattedDate}</td>
+                              <td className="p-3 text-center text-slate-600 font-mono">{item.durationFormatted || '15m 00s'}</td>
+                              <td className="p-3 text-center">
+                                <span className="font-semibold text-slate-800">
+                                  {item.correctCount} / {item.totalQuestions}
+                                </span>
+                                {item.partialCount ? (
+                                  <span className="text-[10px] text-amber-600 block">(+ {item.partialCount} sebagian)</span>
+                                ) : null}
+                              </td>
+                              <td className="p-3 text-center font-black text-sm text-slate-950">
+                                <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-200">
+                                  {item.score}
+                                </span>
+                              </td>
                               <td className="p-3 text-center">
                                 <span className={`px-2.5 py-1 rounded-full text-[11px] font-bold ${
-                                  r.passed
+                                  item.passed
                                     ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
                                     : 'bg-rose-100 text-rose-800 border border-rose-200'
                                 }`}>
-                                  {r.passed ? 'Tuntas' : 'Remedial'}
+                                  {item.passed ? 'Tuntas' : 'Remedial'}
                                 </span>
                               </td>
                               <td className="p-3 text-center space-x-1">
                                 <button
                                   type="button"
-                                  onClick={() => setSelectedStudentResult(r)}
+                                  onClick={() => setSelectedStudentResult(item)}
                                   className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold cursor-pointer"
-                                  title="Analisis Butir & Rekomendasi"
+                                  title="Analisis Butir &amp; Rekomendasi"
                                 >
                                   Analisis
                                 </button>
                                 <button
                                   type="button"
-                                  onClick={() => onPrintStudentReport(r)}
+                                  onClick={() => onPrintStudentReport(item)}
                                   className="px-2.5 py-1 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg text-xs font-semibold cursor-pointer"
                                   title="Cetak Rapor Hasil Siswa"
                                 >
@@ -1039,7 +1607,7 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
               )}
 
               {/* ========================================================================= */}
-              {/* TAB 4: PENGATURAN IDENTITAS SEKOLAH & PEJABAT                             */}
+              {/* TAB 5: PENGATURAN IDENTITAS SEKOLAH & PEJABAT                             */}
               {/* ========================================================================= */}
               {activeTab === 'pengaturan' && (
                 <div className="space-y-6 max-w-3xl">
@@ -1188,7 +1756,7 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
               )}
 
               {/* ========================================================================= */}
-              {/* TAB 5: INTEGRASI SPREADSHEET                                              */}
+              {/* TAB 6: INTEGRASI SPREADSHEET                                              */}
               {/* ========================================================================= */}
               {activeTab === 'script' && (
                 <div className="space-y-6 max-w-3xl">
@@ -1198,10 +1766,10 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
                       <span>Mendukung Banyak Aplikasi / Mapel Berbeda dalam 1 Google Spreadsheet</span>
                     </div>
                     <h3 className="font-bold text-base text-slate-900">
-                      Otomatisasi Sinkronisasi Google Sheets Multi-Mapel
+                      Otomatisasi Sinkronisasi Google Sheets Multi-Mapel &amp; Real-Time
                     </h3>
                     <p className="text-xs text-slate-600 mt-1 leading-relaxed">
-                      Anda dapat menggunakan <strong>1 Google Spreadsheet yang sama</strong> untuk semua aplikasi tes (IPAS, Matematika, Bahasa Indonesia, dll). Script ini otomatis membuat dan memisahkan tab per mata pelajaran serta mencatat rekap seluruh nilai ke tab master.
+                      Anda dapat menggunakan <strong>1 Google Spreadsheet yang sama</strong> untuk semua aplikasi tes. Script ini mendukung pencatatan nilai otomatis (POST) dan pembacaan daftar nilai real-time (GET) langsung ke Panel Guru.
                     </p>
                   </div>
 
@@ -1219,7 +1787,7 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
                       />
                     </div>
 
-                    <div className="flex items-center gap-3">
+                    <div className="flex flex-wrap items-center gap-3">
                       <button
                         type="button"
                         onClick={handleSaveSettings}
@@ -1233,7 +1801,15 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
                         disabled={testingWebhook}
                         className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl font-semibold text-xs cursor-pointer disabled:opacity-50"
                       >
-                        {testingWebhook ? 'Menguji...' : 'Uji Koneksi'}
+                        {testingWebhook ? 'Menguji POST...' : 'Uji Kirim (POST)'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleTestGet}
+                        disabled={testingGet}
+                        className="px-4 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 rounded-xl font-semibold text-xs cursor-pointer disabled:opacity-50"
+                      >
+                        {testingGet ? 'Membaca GET...' : 'Uji Tarik Data (GET)'}
                       </button>
                     </div>
 
@@ -1242,12 +1818,18 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
                         {webhookTestMessage}
                       </p>
                     )}
+
+                    {testGetMessage && (
+                      <p className="text-xs p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-900 font-medium">
+                        {testGetMessage}
+                      </p>
+                    )}
                   </div>
 
                   <div className="bg-slate-900 rounded-2xl p-5 text-white space-y-3">
                     <div className="flex items-center justify-between">
                       <span className="text-xs font-bold text-slate-300">
-                        Kode Google Apps Script (Salin ke Extensions &gt; Apps Script di Google Sheets):
+                        Kode Google Apps Script Dual (POST Simpan &amp; GET Baca Real-Time):
                       </span>
                       <button
                         type="button"
@@ -1258,7 +1840,7 @@ export const TeacherPanel: React.FC<TeacherPanelProps> = ({
                         <span>{copiedScript ? 'Tersalin' : 'Salin Kode'}</span>
                       </button>
                     </div>
-                    <pre className="text-[11px] font-mono text-emerald-300 bg-black/40 p-3 rounded-xl overflow-x-auto max-h-48">
+                    <pre className="text-[11px] font-mono text-emerald-300 bg-black/40 p-3 rounded-xl overflow-x-auto max-h-56">
                       {GOOGLE_APPS_SCRIPT_SAMPLE}
                     </pre>
                   </div>

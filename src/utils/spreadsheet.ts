@@ -244,6 +244,21 @@ export function getAllExamResults(): ExamResultData[] {
 }
 
 /**
+ * Broadcasts exam updates across browser tabs in real time
+ */
+export function broadcastExamSync(type: 'NEW_SUBMISSION' | 'REFRESH_RESULTS', data?: any): void {
+  try {
+    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+      const channel = new BroadcastChannel('sdn3_exam_sync');
+      channel.postMessage({ type, data, timestamp: Date.now() });
+      channel.close();
+    }
+  } catch (e) {
+    // Ignore unsupported browser environments
+  }
+}
+
+/**
  * Saves a new exam result and attempts auto-sync to Spreadsheet
  */
 export async function saveExamResult(result: ExamResultData): Promise<ExamResultData> {
@@ -260,7 +275,11 @@ export async function saveExamResult(result: ExamResultData): Promise<ExamResult
     }
   }
 
-  const updatedResult = { ...result, sentToSpreadsheet: sentToSheet };
+  const updatedResult: ExamResultData = {
+    ...result,
+    sentToSpreadsheet: sentToSheet,
+    source: 'local',
+  };
   const updatedList = [updatedResult, ...currentList.filter((r) => r.id !== result.id)];
 
   try {
@@ -268,6 +287,9 @@ export async function saveExamResult(result: ExamResultData): Promise<ExamResult
   } catch (e) {
     console.error('Failed to save result in localStorage:', e);
   }
+
+  // Broadcast real-time update to other tabs (such as the open Teacher Panel)
+  broadcastExamSync('NEW_SUBMISSION', updatedResult);
 
   return updatedResult;
 }
@@ -278,6 +300,7 @@ export async function saveExamResult(result: ExamResultData): Promise<ExamResult
 export function deleteExamResult(id: string): void {
   const list = getAllExamResults().filter((item) => item.id !== id);
   localStorage.setItem(STORAGE_KEY_RESULTS, JSON.stringify(list));
+  broadcastExamSync('REFRESH_RESULTS');
 }
 
 /**
@@ -285,6 +308,7 @@ export function deleteExamResult(id: string): void {
  */
 export function clearAllExamResults(): void {
   localStorage.setItem(STORAGE_KEY_RESULTS, JSON.stringify([]));
+  broadcastExamSync('REFRESH_RESULTS');
 }
 
 /**
@@ -293,6 +317,7 @@ export function clearAllExamResults(): void {
 export function resetToSampleResults(): ExamResultData[] {
   const mock = getMockInitialResults();
   localStorage.setItem(STORAGE_KEY_RESULTS, JSON.stringify(mock));
+  broadcastExamSync('REFRESH_RESULTS');
   return mock;
 }
 
@@ -340,6 +365,238 @@ export async function sendToGoogleSheetWebhook(
     console.error('Error posting to Google Sheets webhook:', err);
     return false;
   }
+}
+
+/**
+ * Fetches real-time student exam results directly from Google Spreadsheet (Apps Script Web App or GViz API)
+ */
+export async function fetchSpreadsheetResults(
+  urlParam: string,
+  settings: ExamSettings,
+  questions: Question[] = INITIAL_QUESTIONS
+): Promise<{ success: boolean; data: ExamResultData[]; message: string; count: number }> {
+  const targetUrl = (urlParam || settings.sheetWebhookUrl || '').trim();
+
+  if (!targetUrl || !targetUrl.startsWith('http')) {
+    return {
+      success: false,
+      data: [],
+      message: 'URL Google Spreadsheet / Web App belum dikonfigurasi.',
+      count: 0,
+    };
+  }
+
+  // CASE 1: Google Sheets Direct Spreadsheet URL (e.g. docs.google.com/spreadsheets/d/{id}/...)
+  const sheetDocMatch = targetUrl.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (sheetDocMatch && sheetDocMatch[1]) {
+    const spreadsheetId = sheetDocMatch[1];
+    const gvizUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/gviz/tq?tqx=out:json&t=${Date.now()}`;
+
+    try {
+      const resp = await fetch(gvizUrl);
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      const rawText = await resp.text();
+      // Google GViz outputs: /*O_o*/\ngoogle.visualization.Query.setResponse({...});
+      const jsonStart = rawText.indexOf('{');
+      const jsonEnd = rawText.lastIndexOf('}');
+      if (jsonStart !== -1 && jsonEnd !== -1) {
+        const jsonStr = rawText.substring(jsonStart, jsonEnd + 1);
+        const parsed = JSON.parse(jsonStr);
+        const rows = parsed?.table?.rows || [];
+
+        const results: ExamResultData[] = rows
+          .map((r: any, rIdx: number) => {
+            const cells = r.c || [];
+            const getVal = (idx: number) => cells[idx]?.v ?? cells[idx]?.f ?? '';
+
+            // Check if column 5 (fullName) or column 0 has content
+            const fullName = String(getVal(5) || getVal(1) || '').trim();
+            if (!fullName || fullName.toLowerCase().includes('nama siswa')) return null;
+
+            const timestamp = String(getVal(0) || new Date().toLocaleString('id-ID'));
+            const subject = String(getVal(1) || settings.subject);
+            const className = String(getVal(3) || settings.className);
+            const absenceNumber = String(getVal(4) || (rIdx + 1));
+            const correctCount = Number(getVal(6)) || 0;
+            const partialCount = Number(getVal(7)) || 0;
+            const incorrectCount = Number(getVal(8)) || 0;
+            const totalQuestions = Number(getVal(9)) || questions.length || 40;
+            const score = Number(getVal(10)) || 0;
+            const status = String(getVal(11) || (score >= settings.kktp ? 'Tuntas' : 'Remedial'));
+            const duration = String(getVal(12) || '15m 00s');
+
+            const passed = status.toLowerCase().includes('tuntas') || score >= settings.kktp;
+
+            return {
+              id: `sheet-gviz-${absenceNumber}-${rIdx}-${Date.now()}`,
+              student: {
+                fullName,
+                absenceNumber,
+                className,
+              },
+              timestamp: new Date().toISOString(),
+              formattedDate: timestamp,
+              durationFormatted: duration,
+              totalQuestions,
+              correctCount,
+              partialCount,
+              incorrectCount,
+              score,
+              passed,
+              kktp: settings.kktp,
+              breakdown: {
+                pg: { correct: correctCount, total: 30 },
+                kategori: { correct: partialCount > 0 ? 8 : 10, partial: partialCount, total: 10 },
+              },
+              evaluations: [],
+              sentToSpreadsheet: true,
+              source: 'spreadsheet',
+              spreadsheetRow: rIdx + 2,
+            } as ExamResultData;
+          })
+          .filter(Boolean) as ExamResultData[];
+
+        return {
+          success: true,
+          data: results,
+          message: `Berhasil mengambil ${results.length} data siswa langsung dari Google Spreadsheet.`,
+          count: results.length,
+        };
+      }
+    } catch (err: any) {
+      console.warn('GViz fetch failed:', err);
+    }
+  }
+
+  // CASE 2: Google Apps Script Web App URL (script.google.com/macros/s/.../exec)
+  try {
+    const sep = targetUrl.includes('?') ? '&' : '?';
+    const requestUrl = `${targetUrl}${sep}action=getResults&subject=${encodeURIComponent(settings.subject)}&_t=${Date.now()}`;
+
+    const resp = await fetch(requestUrl, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json, text/plain, */*',
+      },
+    });
+
+    if (resp.ok) {
+      const json = await resp.json();
+      if (json && json.status === 'success' && Array.isArray(json.data)) {
+        const results: ExamResultData[] = json.data.map((row: any, rIdx: number) => {
+          const score = Number(row.score) || 0;
+          const passed =
+            String(row.status || '').toLowerCase().includes('tuntas') || score >= settings.kktp;
+          const totalQuestions = Number(row.totalQuestions) || questions.length || 40;
+          const correctCount = Number(row.correctCount) || 0;
+          const partialCount = Number(row.partialCount) || 0;
+          const incorrectCount = Number(row.incorrectCount) || (totalQuestions - correctCount - partialCount);
+
+          return {
+            id: `sheet-live-${row.absenceNumber || rIdx}-${rIdx}`,
+            student: {
+              fullName: String(row.fullName || 'Siswa'),
+              absenceNumber: String(row.absenceNumber || `${rIdx + 1}`),
+              className: String(row.className || settings.className),
+            },
+            timestamp: row.isoTimestamp || new Date().toISOString(),
+            formattedDate: row.timestamp || new Date().toLocaleString('id-ID'),
+            durationFormatted: row.duration || '15m 00s',
+            totalQuestions,
+            correctCount,
+            partialCount,
+            incorrectCount,
+            score,
+            passed,
+            kktp: settings.kktp,
+            breakdown: {
+              pg: { correct: correctCount, total: 30 },
+              kategori: { correct: 0, partial: partialCount, total: 10 },
+            },
+            evaluations: [],
+            sentToSpreadsheet: true,
+            source: 'spreadsheet',
+            spreadsheetRow: row.rowIndex || rIdx + 2,
+          } as ExamResultData;
+        });
+
+        return {
+          success: true,
+          data: results,
+          message: `Berhasil terhubung secara real-time! Ditemukan ${results.length} baris nilai di Spreadsheet.`,
+          count: results.length,
+        };
+      }
+    }
+  } catch (err: any) {
+    // If CORS or doGet is not deployed yet
+    console.warn('Google Apps Script GET failed:', err);
+  }
+
+  return {
+    success: false,
+    data: [],
+    message: 'Koneksi ke Web App Spreadsheet belum merespons data GET. Pastikan Apps Script telah di-deploy dengan fungsi doGet() terbaru.',
+    count: 0,
+  };
+}
+
+/**
+ * Merges remote spreadsheet results with local exam submissions without duplicate loss
+ */
+export function mergeSpreadsheetAndLocalResults(
+  localResults: ExamResultData[],
+  remoteResults: ExamResultData[]
+): ExamResultData[] {
+  if (!remoteResults || remoteResults.length === 0) {
+    return localResults;
+  }
+
+  // Create a working copy
+  const mergedMap = new Map<string, ExamResultData>();
+
+  // Insert local results first
+  localResults.forEach((loc) => {
+    const key = `${loc.student.absenceNumber}-${loc.student.fullName.trim().toLowerCase()}`;
+    mergedMap.set(key, loc);
+  });
+
+  // Merge or append remote spreadsheet rows
+  remoteResults.forEach((rem) => {
+    const key = `${rem.student.absenceNumber}-${rem.student.fullName.trim().toLowerCase()}`;
+    const existing = mergedMap.get(key);
+    if (existing) {
+      // Mark as verified synced in spreadsheet
+      mergedMap.set(key, {
+        ...existing,
+        sentToSpreadsheet: true,
+        source: 'spreadsheet',
+        spreadsheetRow: rem.spreadsheetRow,
+        formattedDate: rem.formattedDate || existing.formattedDate,
+      });
+    } else {
+      // New record from remote spreadsheet (e.g. submitted from another student phone/device)
+      mergedMap.set(key, rem);
+    }
+  });
+
+  const merged = Array.from(mergedMap.values());
+  // Sort by absence number ascending or recent
+  merged.sort((a, b) => {
+    const noA = parseInt(a.student.absenceNumber, 10) || 0;
+    const noB = parseInt(b.student.absenceNumber, 10) || 0;
+    return noA - noB;
+  });
+
+  try {
+    localStorage.setItem(STORAGE_KEY_RESULTS, JSON.stringify(merged));
+  } catch {
+    // Ignore storage errors
+  }
+
+  return merged;
 }
 
 /**
@@ -457,7 +714,7 @@ export function downloadMatrixItemAnalysisCSV(
   link.href = url;
   link.setAttribute(
     'download',
-    `Matriks_Analisis_Butir_Soal_IPAS_Kelas_III_SDN3_Loloan_Timur_${new Date().toISOString().slice(0, 10)}.csv`
+    `Matriks_Analisis_Butir_Soal_Bahasa_Indonesia_Kelas_III_SDN3_Loloan_Timur_${new Date().toISOString().slice(0, 10)}.csv`
   );
   document.body.appendChild(link);
   link.click();
@@ -467,14 +724,20 @@ export function downloadMatrixItemAnalysisCSV(
 
 /**
  * Sample Google Apps Script code for multi-subject teacher setup in ONE Google Sheets
+ * Supports POST (submitting student results) and GET (real-time live fetch in Teacher Panel)
  */
-export const GOOGLE_APPS_SCRIPT_SAMPLE = `function doPost(e) {
+export const GOOGLE_APPS_SCRIPT_SAMPLE = `/**
+ * GOOGLE APPS SCRIPT UNTUK SD NEGERI 3 LOLOAN TIMUR
+ * Mendukung POST (mencatat nilai siswa) dan GET (menampilkan daftar nilai real-time di Panel Guru)
+ */
+
+function doPost(e) {
   try {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var data = JSON.parse(e.postData.contents);
 
-    // 1. Ambil nama mata pelajaran (contoh: "IPAS", "Matematika", "Bahasa_Indonesia")
-    var rawSubject = data.subject || "Lainnya";
+    // 1. Ambil nama mata pelajaran (contoh: "Bahasa_Indonesia", "IPAS", "Matematika")
+    var rawSubject = data.subject || "Bahasa_Indonesia";
     var sheetName = rawSubject.replace(/[/\\\\?*:\\[\\]]/g, "_").trim().substring(0, 30);
     
     // 2. Cari tab sesuai nama mata pelajaran. Jika belum ada, buat otomatis!
@@ -555,6 +818,71 @@ export const GOOGLE_APPS_SCRIPT_SAMPLE = `function doPost(e) {
       .setMimeType(ContentService.MimeType.JSON);
   } catch (err) {
     return ContentService.createTextOutput(JSON.stringify({ result: "error", error: err.toString() }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/**
+ * FUNGSI GET: Mengambil daftar nilai siswa secara real-time untuk ditampilkan di Panel Guru
+ */
+function doGet(e) {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheetName = (e && e.parameter && (e.parameter.sheet || e.parameter.subject)) || "Bahasa_Indonesia";
+    sheetName = sheetName.replace(/[/\\\\?*:\\[\\]]/g, "_").trim().substring(0, 30);
+    
+    // Cari tab mapel, atau tab SEMUA_MAPEL, atau tab aktif pertama
+    var sheet = ss.getSheetByName(sheetName) || ss.getSheetByName("SEMUA_MAPEL") || ss.getSheets()[0];
+    
+    if (!sheet) {
+      return ContentService.createTextOutput(JSON.stringify({ status: "success", count: 0, data: [] }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    var values = sheet.getDataRange().getValues();
+    if (values.length <= 1) {
+      return ContentService.createTextOutput(JSON.stringify({ status: "success", count: 0, data: [] }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    var headers = values[0];
+    var data = [];
+    for (var i = 1; i < values.length; i++) {
+      var row = values[i];
+      if (!row || row.length === 0 || !row[5]) continue; // lewati baris kosong tanpa nama
+      
+      data.push({
+        rowIndex: i + 1,
+        timestamp: String(row[0] || ""),
+        subject: String(row[1] || ""),
+        topic: String(row[2] || ""),
+        className: String(row[3] || ""),
+        absenceNumber: String(row[4] || ""),
+        fullName: String(row[5] || ""),
+        correctCount: Number(row[6]) || 0,
+        partialCount: Number(row[7]) || 0,
+        incorrectCount: Number(row[8]) || 0,
+        totalQuestions: Number(row[9]) || 40,
+        score: Number(row[10]) || 0,
+        status: String(row[11] || ""),
+        duration: String(row[12] || ""),
+        pgScore: String(row[13] || ""),
+        kategoriScore: String(row[14] || "")
+      });
+    }
+    
+    // Urutkan data terbaru di paling atas
+    data.reverse();
+    
+    return ContentService.createTextOutput(JSON.stringify({
+      status: "success",
+      sheetName: sheet.getName(),
+      count: data.length,
+      updatedAt: new Date().toISOString(),
+      data: data
+    })).setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({ status: "error", message: err.toString() }))
       .setMimeType(ContentService.MimeType.JSON);
   }
 }`;
